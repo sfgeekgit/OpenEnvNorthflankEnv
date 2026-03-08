@@ -371,8 +371,6 @@ def main():
         model_name=MODEL_NAME,
         max_seq_length=MAX_SEQ_LENGTH,
         load_in_4bit=True,
-        fast_inference=True,
-        max_lora_rank=LORA_RANK,
     )
 
     model = FastLanguageModel.get_peft_model(
