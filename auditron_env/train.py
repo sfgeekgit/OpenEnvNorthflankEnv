@@ -25,7 +25,7 @@ from datetime import datetime
 from trl import GRPOConfig, GRPOTrainer
 
 # ── Config (all tunables in one place) ────────────────────────────────────────
-MODEL_NAME = os.environ.get("MODEL_NAME", "unsloth/Qwen2.5-0.5B-Instruct")
+MODEL_NAME = os.environ.get("MODEL_NAME", "unsloth/Qwen2.5-1.5B-Instruct")
 MAX_SEQ_LENGTH = int(os.environ.get("MAX_SEQ_LENGTH", "4096"))
 LORA_RANK = int(os.environ.get("LORA_RANK", "16"))
 NUM_TRAINING_STEPS = int(os.environ.get("NUM_TRAINING_STEPS", "500"))
@@ -139,7 +139,7 @@ def generate_prompts(num_episodes: int) -> list[dict]:
             for sid in SUPPLIER_IDS:
                 obs = env.get_supplier_obs(sid)
                 idx = len(prompts)
-                prompts.append({"prompt": build_prompt(obs, "supplier")})
+                prompts.append({"prompt": build_prompt(obs, "supplier"), "bids": {}})
                 ep_supplier_prompts[sid].append(idx)
 
                 # Random supplier action to advance env
@@ -154,7 +154,7 @@ def generate_prompts(num_episodes: int) -> list[dict]:
 
             # Collect auditor prompt
             obs = env.get_auditor_obs()
-            prompts.append({"prompt": build_prompt(obs, "auditor")})
+            prompts.append({"prompt": build_prompt(obs, "auditor"), "bids": obs.get("bids", {})})
             pick = random.choice(SUPPLIER_IDS)
             env.step(AuditronAction(
                 agent_id="auditor",
@@ -163,7 +163,7 @@ def generate_prompts(num_episodes: int) -> list[dict]:
 
             # Collect buyer prompt
             obs = env.get_buyer_obs()
-            prompts.append({"prompt": build_prompt(obs, "buyer")})
+            prompts.append({"prompt": build_prompt(obs, "buyer"), "bids": {}})
             pick = random.choice(SUPPLIER_IDS)
             result = env.step(AuditronAction(
                 agent_id="buyer",
@@ -226,6 +226,8 @@ def format_reward(completions, **kwargs):
                 assert "reason" in data
                 score = 2.0
                 if isinstance(data.get("flags"), list):
+                    # Sanitize flags — only real supplier IDs count
+                    data["flags"] = [f for f in data["flags"] if f in SUPPLIER_IDS]
                     score += 0.5
             elif agent_type == "buyer":
                 assert data.get("pick") in SUPPLIER_IDS
@@ -237,14 +239,18 @@ def format_reward(completions, **kwargs):
 
             # Log auditor/buyer completions (suppliers logged richly in economic_reward)
             if agent_type in ("auditor", "buyer"):
-                _log_reasoning({
+                entry = {
                     "step": step, "gen": i, "agent": agent_type,
                     "valid_json": True,
                     "pick": data.get("pick"), "flags": data.get("flags"),
                     "reason": data.get("reason", ""),
                     "reason_words": len(str(data.get("reason", "")).split()),
                     "format_score": score, "raw": completion.strip(),
-                })
+                }
+                if agent_type == "auditor":
+                    bids_list = kwargs.get("bids", [])
+                    entry["bids"] = bids_list[i] if i < len(bids_list) else {}
+                _log_reasoning(entry)
         except Exception:
             score = -5.0  # steep penalty — invalid JSON must never be worth it
             # Log all agent failures — this is the only place we capture invalid JSON
@@ -421,7 +427,7 @@ def evaluate_model(model, tokenizer, num_episodes: int = 5, eval_step: int = Non
         max_rounds = min(TOTAL_PARTS, 5) if os.environ.get("DRY_RUN") == "1" else TOTAL_PARTS
 
     for ep in range(num_episodes):
-        obs_reset = env.reset(seed=9000 + ep)
+        obs_reset = env.reset(seed=(eval_step or 9000) * 100 + ep)
         s = env.state
         # Record personality assignments for this episode
         personalities = {
@@ -456,15 +462,19 @@ def evaluate_model(model, tokenizer, num_episodes: int = 5, eval_step: int = Non
                     m["valid"] += 1
                 try:
                     parsed = json.loads(action_str)
+                    if not isinstance(parsed, dict):
+                        parsed = {}
                 except Exception:
                     parsed = {}
+                # Use resolved bid from env state (handles fallback when model outputs invalid JSON)
+                resolved = env.state.supplier_bids.get(sid, {})
                 round_log["suppliers"][sid] = {
                     "personality": obs["personality"],
                     "required_strength": obs["required_strength"],
                     "cost_per_point": obs["your_cost_per_point"],
-                    "bid_price": parsed.get("bid_price"),
-                    "actual_strength": parsed.get("actual_strength"),
-                    "cheating": parsed.get("actual_strength", obs["required_strength"]) < obs["required_strength"],
+                    "bid_price": resolved.get("bid_price") or parsed.get("bid_price"),
+                    "actual_strength": resolved.get("actual_strength") or parsed.get("actual_strength"),
+                    "cheating": (resolved.get("actual_strength") or obs["required_strength"]) < obs["required_strength"],
                     "valid": valid,
                     "raw": action_str.strip(),
                 }
@@ -483,6 +493,8 @@ def evaluate_model(model, tokenizer, num_episodes: int = 5, eval_step: int = Non
                 m["valid"] += 1
             try:
                 parsed = json.loads(action_str)
+                if not isinstance(parsed, dict):
+                    parsed = {}
             except Exception:
                 parsed = {}
             round_log["auditor"] = {
@@ -510,6 +522,8 @@ def evaluate_model(model, tokenizer, num_episodes: int = 5, eval_step: int = Non
                 m["valid"] += 1
             try:
                 parsed = json.loads(action_str)
+                if not isinstance(parsed, dict):
+                    parsed = {}
             except Exception:
                 parsed = {}
             buyer_pick = parsed.get("pick")
@@ -524,6 +538,7 @@ def evaluate_model(model, tokenizer, num_episodes: int = 5, eval_step: int = Non
             # Per-round detail log — powers per-supplier, failure rate, buyer-follows-auditor charts
             auditor_pick = round_log["auditor"].get("pick")
             resolution = result.observation.get("resolution", {})
+            round_log["part_failed"] = resolution.get("failed", False)
             winner = buyer_pick  # buyer's pick is the winner
             winner_sup = round_log["suppliers"].get(winner, {})
             _log_episode({
@@ -566,6 +581,18 @@ def evaluate_model(model, tokenizer, num_episodes: int = 5, eval_step: int = Non
                 m["supplier_profits"] = summary.get("supplier_profits", {})
                 m["rewards"]     = summary.get("final_rewards", {})
                 break
+
+        # If episode ended early (checkpoint eval with max_rounds < TOTAL_PARTS),
+        # compute spend/failures from round logs since done was never True
+        if "buyer_spend" not in m:
+            m["failures"] = sum(1 for r in m["rounds"] if r.get("part_failed"))
+            m["buyer_spend"] = sum(
+                r["suppliers"].get(r["buyer"].get("pick", ""), {}).get("bid_price") or 0
+                for r in m["rounds"]
+            )
+            m["auditor_tpr"] = 0
+            m["auditor_fpr"] = 0
+            m["cheaters"] = []
 
         m["format_accuracy"] = m["valid"] / max(1, m["total"])
         all_metrics.append(m)
@@ -708,11 +735,115 @@ def main():
     model.save_pretrained_merged(OUTPUT_DIR, tokenizer, save_method="merged_16bit")
     print(f"Model saved to {OUTPUT_DIR}/")
 
-    # 5. Evaluate
-    print("\n" + "=" * 60)
-    print("EVALUATION")
-    print("=" * 60)
-    evaluate_model(model, tokenizer, num_episodes=EVAL_EPISODES)
+    # 5. Final eval — 1 full 50-round episode, rich per-round logging for charts
+    print("\n[Final eval — full 50-round episode]")
+    from unsloth import FastLanguageModel
+    FastLanguageModel.for_inference(model)
+    final_env = AuditronEnv()
+    final_env.reset(seed=99999)
+    s = final_env.state
+    personalities = {sid: s.supplier_personalities[sid]["name"] for sid in SUPPLIER_IDS}
+    print(f"Personalities: {personalities}")
+    cumulative_spend = 0.0
+    cumulative_failures = 0
+    cumulative_profits = {sid: 0.0 for sid in SUPPLIER_IDS}
+
+    for rnd in range(TOTAL_PARTS):
+        # Suppliers
+        sup_obs_list = [final_env.get_supplier_obs(sid) for sid in SUPPLIER_IDS]
+        sup_prompts = [build_prompt(obs, "supplier") for obs in sup_obs_list]
+        sup_actions = generate_actions_batch(model, tokenizer, sup_prompts, max_new_tokens=64)
+        for sid, obs, action_str in zip(SUPPLIER_IDS, sup_obs_list, sup_actions):
+            result = final_env.step(AuditronAction(agent_id=sid, content=action_str))
+            if result.phase == "error":
+                req = obs["required_strength"]
+                cost = obs["your_cost_per_point"]
+                final_env.step(AuditronAction(agent_id=sid, content=json.dumps(
+                    {"bid_price": round(req * cost * 1.1, 1), "actual_strength": req})))
+
+        # Auditor
+        aud_obs = final_env.get_auditor_obs()
+        aud_action = generate_action(model, tokenizer, build_prompt(aud_obs, "auditor"))
+        final_env.step(AuditronAction(agent_id="auditor", content=aud_action))
+        try:
+            aud_parsed = json.loads(aud_action)
+            if not isinstance(aud_parsed, dict): aud_parsed = {}
+        except Exception:
+            aud_parsed = {}
+
+        # Buyer
+        buy_obs = final_env.get_buyer_obs()
+        buy_action = generate_action(model, tokenizer, build_prompt(buy_obs, "buyer"))
+        result = final_env.step(AuditronAction(agent_id="buyer", content=buy_action))
+        try:
+            buy_parsed = json.loads(buy_action)
+            if not isinstance(buy_parsed, dict): buy_parsed = {}
+        except Exception:
+            buy_parsed = {}
+
+        resolution = result.observation.get("resolution", {})
+        winner = buy_parsed.get("pick")
+        failed = resolution.get("failed", False)
+        penalty = resolution.get("penalty", 0.0)
+        winner_bid = final_env.state.supplier_bids.get(winner, {}).get("bid_price", 0) if winner else 0
+        cumulative_spend += (winner_bid or 0) + (penalty or 0)
+        if failed:
+            cumulative_failures += 1
+
+        # Per-supplier data for this round
+        per_supplier = {}
+        for sid in SUPPLIER_IDS:
+            bid_info = final_env.state.supplier_bids.get(sid, {})
+            bid_price = bid_info.get("bid_price", 0) or 0
+            actual_str = bid_info.get("actual_strength", 0)
+            req_str = final_env.state.required_strength
+            cost = sup_obs_list[SUPPLIER_IDS.index(sid)].get("your_cost_per_point", 0)
+            production_cost = req_str * cost
+            round_profit = (bid_price - production_cost) if sid == winner and not failed else 0.0
+            cumulative_profits[sid] += round_profit
+            per_supplier[sid] = {
+                "personality": personalities[sid],
+                "bid_price": bid_price,
+                "actual_strength": actual_str,
+                "cheating": actual_str < req_str if actual_str else False,
+                "won": sid == winner,
+                "round_profit": round_profit,
+                "cumulative_profit": cumulative_profits[sid],
+            }
+
+        _log_episode({
+            "type": "final_round",
+            "round": rnd + 1,
+            "required_strength": final_env.state.required_strength,
+            "personalities": personalities,
+            "auditor_pick": aud_parsed.get("pick"),
+            "auditor_flags": aud_parsed.get("flags", []),
+            "auditor_reason": aud_parsed.get("reason", ""),
+            "buyer_pick": winner,
+            "buyer_followed_auditor": (winner == aud_parsed.get("pick")) if winner else None,
+            "part_failed": failed,
+            "failure_penalty": penalty or 0.0,
+            "round_spend": (winner_bid or 0) + (penalty or 0),
+            "cumulative_spend": cumulative_spend,
+            "cumulative_failures": cumulative_failures,
+            "per_supplier": per_supplier,
+        })
+
+        if result.done:
+            summary = result.observation.get("episode_summary", {})
+            _log_episode({
+                "type": "final_summary",
+                "personalities": personalities,
+                "total_spend": summary.get("buyer_total_spend", cumulative_spend),
+                "total_failures": summary.get("num_failures", cumulative_failures),
+                "auditor_tpr": summary.get("auditor_tpr"),
+                "auditor_fpr": summary.get("auditor_fpr"),
+                "supplier_profits": summary.get("supplier_profits", {}),
+                "supplier_ranking": summary.get("supplier_ranking", []),
+                "final_rewards": summary.get("final_rewards", {}),
+            })
+            print(f"Final eval done. Spend={cumulative_spend:.1f}  Failures={cumulative_failures}")
+            break
 
 
 if __name__ == "__main__":
