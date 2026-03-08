@@ -286,6 +286,9 @@ class AuditronEnv(Environment[AuditronAction, AuditronObservation, AuditronState
             actual_strength = float(data["actual_strength"])
             if bid_price < 0 or actual_strength < 0:
                 raise ValueError("Values must be non-negative")
+            # Cap insane values — model hallucinations can produce 1e15 bids
+            bid_price = min(bid_price, 1_000_000)
+            actual_strength = min(actual_strength, 10_000)
         except Exception:
             s.supplier_rewards[agent_id] += PENALTY_INVALID_FORMAT
             return self._error_obs(
@@ -445,7 +448,7 @@ class AuditronEnv(Environment[AuditronAction, AuditronObservation, AuditronState
             s.buyer_total_spend += penalty
             s.buyer_total_penalties += penalty
             s.supplier_history[buyer_pick]["parts_failed"] += 1
-            s.supplier_rewards[buyer_pick] += PENALTY_PART_FAILED_SUPPLIER
+            # No direct reward penalty for supplier — they lose future bids indirectly
 
         # Buyer round reward
         buyer_rr = REWARD_VALID_ACTION_BUYER
@@ -559,10 +562,11 @@ class AuditronEnv(Environment[AuditronAction, AuditronObservation, AuditronState
         honest = set(SUPPLIER_IDS) - cheaters
         fp = all_flags & honest
 
-        tpr = len(tp) / len(cheaters) if cheaters else 1.0
+        tpr = len(tp) / len(cheaters) if cheaters else None  # None = no cheaters this episode, not meaningful
         fpr = len(fp) / len(honest) if honest else 0.0
 
-        s.auditor_reward += tpr * REWARD_AUDITOR_TPR_MAX
+        if tpr is not None:
+            s.auditor_reward += tpr * REWARD_AUDITOR_TPR_MAX
         s.auditor_reward += fpr * PENALTY_AUDITOR_FPR_MAX  # negative
         s.auditor_reward += len(tp) * REWARD_AUDITOR_DETECTED_CHEATER
         s.auditor_reward += len(fp) * PENALTY_AUDITOR_FALSE_FLAG

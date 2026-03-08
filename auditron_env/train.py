@@ -17,22 +17,32 @@ import os
 import json
 import random
 import re
+import time
+from datetime import datetime
 
 # Import TRL before unsloth so we get the standard (unpatched) GRPOTrainer.
 # Unsloth is still used for fast model loading and LoRA — just not for training.
 from trl import GRPOConfig, GRPOTrainer
 
 # ── Config (all tunables in one place) ────────────────────────────────────────
-MODEL_NAME = os.environ.get("MODEL_NAME", "unsloth/Qwen2.5-1.5B-Instruct")
-MAX_SEQ_LENGTH = int(os.environ.get("MAX_SEQ_LENGTH", "2048"))
+MODEL_NAME = os.environ.get("MODEL_NAME", "unsloth/Qwen2.5-0.5B-Instruct")
+MAX_SEQ_LENGTH = int(os.environ.get("MAX_SEQ_LENGTH", "4096"))
 LORA_RANK = int(os.environ.get("LORA_RANK", "16"))
 NUM_TRAINING_STEPS = int(os.environ.get("NUM_TRAINING_STEPS", "500"))
 NUM_GENERATIONS = int(os.environ.get("NUM_GENERATIONS", "4"))
 NUM_PROMPT_EPISODES = int(os.environ.get("NUM_PROMPT_EPISODES", "20"))
 LEARNING_RATE = float(os.environ.get("LEARNING_RATE", "5e-5"))
 HF_TOKEN_FILE = os.environ.get("HF_TOKEN_FILE", "/home/openenv/HFTOKEN")
-OUTPUT_DIR = os.environ.get("OUTPUT_DIR", "auditron_trained")
-EVAL_EPISODES = int(os.environ.get("EVAL_EPISODES", "5"))
+EVAL_EPISODES = int(os.environ.get("EVAL_EPISODES", "5"))  # 3-5 for quick runs; bump to 10+ for real runs (500+ steps) for stable TPR/FPR
+MAX_COMPLETION_LENGTH = int(os.environ.get("MAX_COMPLETION_LENGTH", "256"))
+# CHECKPOINT_EVERY: how often (in training steps) to pause and run a quick eval.
+# Kept SPARSE for quick runs (80 steps → 2 checkpoints).
+# For real runs (500+ steps), set to 50 or lower for smoother curves.
+CHECKPOINT_EVERY = int(os.environ.get("CHECKPOINT_EVERY", "40"))
+# CHECKPOINT_ROUNDS: rounds per episode during checkpoint evals (not the final eval).
+# 15 rounds is enough to see profit rankings — 3x faster than full 50-round eval.
+# Final eval always runs full TOTAL_PARTS rounds.
+CHECKPOINT_ROUNDS = int(os.environ.get("CHECKPOINT_ROUNDS", "15"))
 
 # Override for dry run
 if os.environ.get("DRY_RUN", "0") == "1":
@@ -40,10 +50,35 @@ if os.environ.get("DRY_RUN", "0") == "1":
     NUM_PROMPT_EPISODES = 2
     NUM_GENERATIONS = 2
     EVAL_EPISODES = 1
+    CHECKPOINT_EVERY = 5
 # ──────────────────────────────────────────────────────────────────────────────
 
+# ── Run timestamp — used for unique log/output filenames ──────────────────────
+RUN_TS = datetime.now().strftime("%Y%m%d_%H%M%S")
+OUTPUT_DIR = os.environ.get("OUTPUT_DIR", f"auditron_trained_{RUN_TS}")
+REASONING_LOG = f"reasoning_{RUN_TS}.jsonl"
+EPISODE_LOG   = f"episodes_{RUN_TS}.jsonl"
+EVAL_LOG      = f"eval_{RUN_TS}.json"
+
+# Global step counter for reward functions (incremented by format_reward)
+_step = [0]
+
+def _log_reasoning(entry: dict):
+    """Append a JSON entry to the reasoning log."""
+    with open(REASONING_LOG, "a") as f:
+        f.write(json.dumps(entry) + "\n")
+
+def _log_episode(entry: dict):
+    """Append a JSON entry to the episode log."""
+    with open(EPISODE_LOG, "a") as f:
+        f.write(json.dumps(entry) + "\n")
+
+print(f"Run timestamp: {RUN_TS}")
+print(f"Reasoning log: {REASONING_LOG}")
+print(f"Episode log:   {EPISODE_LOG}")
+
 from server import AuditronAction, AuditronEnv, SUPPLIER_IDS
-from rewards import TOTAL_PARTS
+from rewards import TOTAL_PARTS, SUPPLIER_RANK_REWARDS
 
 
 # ---------------------------------------------------------------------------
@@ -66,10 +101,16 @@ def build_prompt(obs: dict, agent_type: str) -> list[dict]:
 
     # Pre-format using Qwen ChatML template as a plain string.
     # GRPOTrainer handles string prompts more reliably than message lists.
-    system_msg = (
-        f"You are a {agent_type} in a procurement auction. {system}\n"
-        f"Respond with valid JSON only. Format: {action_format}"
-    )
+    if agent_type == "supplier":
+        system_msg = (
+            f"[AGENT:supplier] {system}\n"
+            f"Output ONLY this exact JSON with no other text: {action_format}"
+        )
+    else:
+        system_msg = (
+            f"[AGENT:{agent_type}] You are a {agent_type} in a procurement auction. {system}\n"
+            f"Respond with valid JSON only. Format: {action_format}"
+        )
     user_msg = f"Current state:\n{json.dumps(obs_clean, indent=2)}"
     return (
         f"<|im_start|>system\n{system_msg}<|im_end|>\n"
@@ -79,7 +120,10 @@ def build_prompt(obs: dict, agent_type: str) -> list[dict]:
 
 
 def generate_prompts(num_episodes: int) -> list[dict]:
-    """Run episodes with random actions to collect training prompts."""
+    """Run episodes with random actions to collect training prompts.
+    End-of-episode supplier ranking rewards are embedded in each supplier prompt
+    as [RANK_REWARD:X] so economic_reward() can apply them during GRPO training.
+    """
     prompts = []
     env = AuditronEnv()
     max_rounds = min(TOTAL_PARTS, 5) if os.environ.get("DRY_RUN") == "1" else TOTAL_PARTS
@@ -87,11 +131,16 @@ def generate_prompts(num_episodes: int) -> list[dict]:
     for ep in range(num_episodes):
         env.reset(seed=ep * 1000 + random.randint(0, 999))
 
+        # Track supplier prompts for this episode so we can inject rank rewards after
+        ep_supplier_prompts = {sid: [] for sid in SUPPLIER_IDS}  # sid → list of prompt indices
+
         for rnd in range(max_rounds):
             # Collect supplier prompts
             for sid in SUPPLIER_IDS:
                 obs = env.get_supplier_obs(sid)
+                idx = len(prompts)
                 prompts.append({"prompt": build_prompt(obs, "supplier")})
+                ep_supplier_prompts[sid].append(idx)
 
                 # Random supplier action to advance env
                 req = obs["required_strength"]
@@ -121,6 +170,13 @@ def generate_prompts(num_episodes: int) -> list[dict]:
                 content=json.dumps({"pick": pick, "reason": "random"}),
             ))
             if result.done:
+                # Episode complete — get final ranking and inject rank reward into prompts
+                summary = result.observation.get("episode_summary", {})
+                ranking = summary.get("supplier_ranking", [])
+                for rank, sid in enumerate(ranking):
+                    rank_reward = SUPPLIER_RANK_REWARDS[rank] if rank < len(SUPPLIER_RANK_REWARDS) else 0
+                    for idx in ep_supplier_prompts[sid]:
+                        prompts[idx]["prompt"] += f"[RANK_REWARD:{rank_reward}]"
                 break
 
     return prompts
@@ -139,12 +195,12 @@ def _extract_json(text: str) -> dict:
 
 
 def _infer_agent_type(prompt_str: str) -> str:
-    """Infer agent type from the system message in the prompt."""
-    if "supplier" in prompt_str.lower() and "bid_price" in prompt_str:
+    """Infer agent type from the unique [AGENT:x] tag embedded in the system message."""
+    if "[AGENT:supplier]" in prompt_str:
         return "supplier"
-    if "oversight" in prompt_str.lower() or "auditor" in prompt_str.lower():
+    if "[AGENT:auditor]" in prompt_str:
         return "auditor"
-    if "buyer" in prompt_str.lower():
+    if "[AGENT:buyer]" in prompt_str:
         return "buyer"
     return "unknown"
 
@@ -153,7 +209,10 @@ def format_reward(completions, **kwargs):
     """Reward for valid JSON with correct fields per agent type."""
     prompts = kwargs.get("prompts", [""] * len(completions))
     scores = []
-    for completion, prompt in zip(completions, prompts):
+    _step[0] += 1
+    step = _step[0]
+
+    for i, (completion, prompt) in enumerate(zip(completions, prompts)):
         prompt_str = str(prompt)
         agent_type = _infer_agent_type(prompt_str)
         try:
@@ -161,31 +220,55 @@ def format_reward(completions, **kwargs):
             if agent_type == "supplier":
                 assert isinstance(data.get("bid_price"), (int, float))
                 assert isinstance(data.get("actual_strength"), (int, float))
-                scores.append(2.0)
+                score = 2.0
             elif agent_type == "auditor":
                 assert data.get("pick") in SUPPLIER_IDS
                 assert "reason" in data
                 score = 2.0
                 if isinstance(data.get("flags"), list):
                     score += 0.5
-                scores.append(score)
             elif agent_type == "buyer":
                 assert data.get("pick") in SUPPLIER_IDS
                 score = 2.0
                 if "reason" in data and len(str(data["reason"])) > 5:
                     score += 0.5
-                scores.append(score)
             else:
-                scores.append(1.0)
+                score = 1.0
+
+            # Log auditor/buyer completions (suppliers logged richly in economic_reward)
+            if agent_type in ("auditor", "buyer"):
+                _log_reasoning({
+                    "step": step, "gen": i, "agent": agent_type,
+                    "valid_json": True,
+                    "pick": data.get("pick"), "flags": data.get("flags"),
+                    "reason": data.get("reason", ""),
+                    "reason_words": len(str(data.get("reason", "")).split()),
+                    "format_score": score, "raw": completion.strip(),
+                })
         except Exception:
-            scores.append(-1.0)
+            score = -5.0  # steep penalty — invalid JSON must never be worth it
+            # Log all agent failures — this is the only place we capture invalid JSON
+            _log_reasoning({
+                "step": step, "gen": i, "agent": agent_type,
+                "valid_json": False, "format_score": score,
+                "parse_error": True, "raw": completion.strip()[:200],
+            })
+
+        scores.append(score)
     return scores
 
 
 def reasoning_reward(completions, **kwargs):
-    """Reward for evidence-based reasoning (auditor & buyer)."""
+    """Reward auditor for evidence-based reasoning. Suppliers get 0 (no reason field).
+    Buyer reason field is kept for readability but not scored here."""
+    prompts = kwargs.get("prompts", [""] * len(completions))
     scores = []
-    for completion in completions:
+    for completion, prompt in zip(completions, prompts):
+        agent_type = _infer_agent_type(str(prompt))
+        if agent_type != "auditor":
+            scores.append(0.0)
+            continue
+
         try:
             data = _extract_json(completion)
             reason = str(data.get("reason", ""))
@@ -194,21 +277,23 @@ def reasoning_reward(completions, **kwargs):
             continue
 
         score = 0.0
-        if re.search(r"supplier_\d", reason):
-            score += 1.0
-        if re.search(r"[\$%]|\d+.*(?:price|bid|cost)", reason, re.I):
-            score += 1.0
-        if re.search(r"fail", reason, re.I):
-            score += 1.0
-        if re.search(r"round\s+\d+", reason, re.I):
-            score += 1.0
-        if re.search(r"cheap|below|above|more|less|lower|higher", reason, re.I):
-            score += 1.0
+        mentions_supplier  = bool(re.search(r"supplier_\d", reason))
+        mentions_price     = bool(re.search(r"[\$%]|\d+.*(?:price|bid|cost)", reason, re.I))
+        mentions_failure   = bool(re.search(r"fail", reason, re.I))
+        mentions_round     = bool(re.search(r"round\s+\d+", reason, re.I))
+        mentions_compare   = bool(re.search(r"cheap|below|above|more|less|lower|higher", reason, re.I))
         words = reason.split()
-        if len(words) >= 20:
-            score += 1.0
-        if len(words) >= 50:
-            score += 1.0
+        long_20  = len(words) >= 20
+        long_50  = len(words) >= 50
+
+        if mentions_supplier: score += 1.0
+        if mentions_price:    score += 1.0
+        if mentions_failure:  score += 1.0
+        if mentions_round:    score += 1.0
+        if mentions_compare:  score += 1.0
+        if long_20:           score += 1.0
+        if long_50:           score += 1.0
+
         scores.append(score)
     return scores
 
@@ -217,9 +302,10 @@ def economic_reward(completions, **kwargs):
     """Reward suppliers for economically sensible bids."""
     prompts = kwargs.get("prompts", [""] * len(completions))
     scores = []
-    for completion, prompt in zip(completions, prompts):
+    for idx, (completion, prompt) in enumerate(zip(completions, prompts)):
         prompt_str = str(prompt)
-        if _infer_agent_type(prompt_str) != "supplier":
+        agent_type = _infer_agent_type(prompt_str)
+        if agent_type != "supplier":
             scores.append(0.0)
             continue
         try:
@@ -242,6 +328,23 @@ def economic_reward(completions, **kwargs):
                     score += 1.0  # profitable
                 if 0.5 * required <= actual <= 1.5 * required:
                     score += 0.5  # reasonable strength
+
+                # End-of-episode ranking reward — embedded in prompt by generate_prompts()
+                rank_match = re.search(r'\[RANK_REWARD:([\d.+-]+)\]', prompt_str)
+                if rank_match:
+                    score += float(rank_match.group(1))
+
+                # Log supplier decisions (valid_json=True here — parse succeeded)
+                _log_reasoning({
+                    "step": _step[0], "gen": idx, "agent": "supplier",
+                    "valid_json": True,
+                    "bid_price": bid, "actual_strength": actual,
+                    "required_strength": required, "cost_per_point": cost_per_point,
+                    "production_cost": round(production_cost, 2),
+                    "profit_margin": round(bid - production_cost, 2),
+                    "cheating": actual < required,
+                    "economic_score": score,
+                })
                 scores.append(score)
             else:
                 scores.append(0.0)
@@ -254,18 +357,15 @@ def economic_reward(completions, **kwargs):
 # Evaluation — run full episodes with the trained model
 # ---------------------------------------------------------------------------
 
-def generate_action(model, tokenizer, prompt_messages: list[dict]) -> str:
-    """Generate a JSON action from the model given chat messages."""
+def generate_action(model, tokenizer, prompt, max_new_tokens=256) -> str:
+    """Generate a JSON action from the model. prompt is a pre-formatted ChatML string."""
     import torch
-    text = tokenizer.apply_chat_template(
-        prompt_messages, tokenize=False, add_generation_prompt=True,
-    )
-    inputs = tokenizer(text, return_tensors="pt").to(model.device)
+    inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
 
     with torch.no_grad():
         outputs = model.generate(
             **inputs,
-            max_new_tokens=256,
+            max_new_tokens=max_new_tokens,
             do_sample=True,
             temperature=0.7,
             pad_token_id=tokenizer.eos_token_id,
@@ -280,85 +380,235 @@ def generate_action(model, tokenizer, prompt_messages: list[dict]) -> str:
         return generated.strip()
 
 
-def evaluate_model(model, tokenizer, num_episodes: int = 5):
-    """Run full episodes and report metrics."""
+def generate_actions_batch(model, tokenizer, prompts, max_new_tokens=64) -> list:
+    """Run multiple prompts in one batched GPU call. Returns list of JSON strings."""
+    import torch
+    tokenizer.padding_side = "left"
+    inputs = tokenizer(prompts, return_tensors="pt", padding=True).to(model.device)
+    input_len = inputs["input_ids"].shape[1]
+
+    with torch.no_grad():
+        outputs = model.generate(
+            **inputs,
+            max_new_tokens=max_new_tokens,
+            do_sample=True,
+            temperature=0.7,
+            pad_token_id=tokenizer.eos_token_id,
+        )
+
+    results = []
+    for i in range(len(prompts)):
+        generated = tokenizer.decode(outputs[i][input_len:], skip_special_tokens=True)
+        try:
+            results.append(generated[generated.index("{"):generated.rindex("}") + 1])
+        except ValueError:
+            results.append(generated.strip())
+    return results
+
+
+def evaluate_model(model, tokenizer, num_episodes: int = 5, eval_step: int = None, max_rounds: int = None):
+    """Run full episodes and report metrics. Logs everything to episode log.
+    eval_step: if set, also logs a periodic_eval summary entry for mid-training checkpoints.
+    max_rounds: rounds per episode. None = full 50. Checkpoint evals use CHECKPOINT_ROUNDS (15)
+                for speed — profit rankings are clear well before round 50.
+    """
     from unsloth import FastLanguageModel
     FastLanguageModel.for_inference(model)
 
     env = AuditronEnv()
     all_metrics = []
-    max_rounds = min(TOTAL_PARTS, 5) if os.environ.get("DRY_RUN") == "1" else TOTAL_PARTS
+    if max_rounds is None:
+        max_rounds = min(TOTAL_PARTS, 5) if os.environ.get("DRY_RUN") == "1" else TOTAL_PARTS
 
     for ep in range(num_episodes):
-        env.reset(seed=9000 + ep)
-        m = {"episode": ep + 1, "valid": 0, "total": 0}
+        obs_reset = env.reset(seed=9000 + ep)
+        s = env.state
+        # Record personality assignments for this episode
+        personalities = {
+            sid: s.supplier_personalities[sid]["name"]
+            for sid in SUPPLIER_IDS
+        }
+        m = {
+            "episode": ep + 1, "valid": 0, "total": 0,
+            "personalities": personalities, "rounds": [],
+        }
+
+        print(f"\n=== Eval Episode {ep + 1} | Personalities: {personalities} ===")
 
         for rnd in range(max_rounds):
-            # Suppliers — use fallback if model output is invalid
-            for sid in SUPPLIER_IDS:
-                obs = env.get_supplier_obs(sid)
-                action = generate_action(model, tokenizer, build_prompt(obs, "supplier"))
+            round_log = {"round": rnd + 1, "suppliers": {}, "auditor": {}, "buyer": {}}
+
+            # Suppliers — batch all 5 into one GPU call (they're independent)
+            sup_obs_list = [env.get_supplier_obs(sid) for sid in SUPPLIER_IDS]
+            sup_prompts  = [build_prompt(obs, "supplier") for obs in sup_obs_list]
+            sup_actions  = generate_actions_batch(model, tokenizer, sup_prompts, max_new_tokens=64)
+
+            for sid, obs, action_str in zip(SUPPLIER_IDS, sup_obs_list, sup_actions):
                 m["total"] += 1
-                result = env.step(AuditronAction(agent_id=sid, content=action))
-                if result.phase == "error":
-                    # Submit valid fallback so env can proceed
+                result = env.step(AuditronAction(agent_id=sid, content=action_str))
+                valid = result.phase != "error"
+                if not valid:
                     req = obs["required_strength"]
                     cost = obs["your_cost_per_point"]
                     fallback = json.dumps({"bid_price": round(req * cost * 1.1, 1), "actual_strength": req})
                     env.step(AuditronAction(agent_id=sid, content=fallback))
                 else:
                     m["valid"] += 1
+                try:
+                    parsed = json.loads(action_str)
+                except Exception:
+                    parsed = {}
+                round_log["suppliers"][sid] = {
+                    "personality": obs["personality"],
+                    "required_strength": obs["required_strength"],
+                    "cost_per_point": obs["your_cost_per_point"],
+                    "bid_price": parsed.get("bid_price"),
+                    "actual_strength": parsed.get("actual_strength"),
+                    "cheating": parsed.get("actual_strength", obs["required_strength"]) < obs["required_strength"],
+                    "valid": valid,
+                    "raw": action_str.strip(),
+                }
 
             # Auditor
             obs = env.get_auditor_obs()
-            action = generate_action(model, tokenizer, build_prompt(obs, "auditor"))
+            action_str = generate_action(model, tokenizer, build_prompt(obs, "auditor"))
             m["total"] += 1
-            result = env.step(AuditronAction(agent_id="auditor", content=action))
-            if result.phase == "error":
+            result = env.step(AuditronAction(agent_id="auditor", content=action_str))
+            valid = result.phase != "error"
+            if not valid:
                 cheapest = min(obs["bids"], key=obs["bids"].get)
                 fallback = json.dumps({"pick": cheapest, "reason": "fallback", "flags": []})
                 env.step(AuditronAction(agent_id="auditor", content=fallback))
             else:
                 m["valid"] += 1
+            try:
+                parsed = json.loads(action_str)
+            except Exception:
+                parsed = {}
+            round_log["auditor"] = {
+                "pick": parsed.get("pick"),
+                "flags": parsed.get("flags", []),
+                "reason": parsed.get("reason", ""),
+                "reason_words": len(str(parsed.get("reason", "")).split()),
+                "valid": valid,
+                "raw": action_str.strip(),
+            }
+            if rnd < 3 or rnd % 10 == 0:  # print a sample of auditor reasoning
+                print(f"  [R{rnd+1}] Auditor pick={parsed.get('pick')} flags={parsed.get('flags')} | reason: {str(parsed.get('reason',''))[:120]}")
 
             # Buyer
             obs = env.get_buyer_obs()
-            action = generate_action(model, tokenizer, build_prompt(obs, "buyer"))
+            action_str = generate_action(model, tokenizer, build_prompt(obs, "buyer"))
             m["total"] += 1
-            result = env.step(AuditronAction(agent_id="buyer", content=action))
-            if result.phase == "error":
+            result = env.step(AuditronAction(agent_id="buyer", content=action_str))
+            valid = result.phase != "error"
+            if not valid:
                 rec = obs["auditor_recommendation"].get("pick", SUPPLIER_IDS[0])
                 fallback = json.dumps({"pick": rec, "reason": "fallback"})
                 result = env.step(AuditronAction(agent_id="buyer", content=fallback))
             else:
                 m["valid"] += 1
+            try:
+                parsed = json.loads(action_str)
+            except Exception:
+                parsed = {}
+            buyer_pick = parsed.get("pick")
+            round_log["buyer"] = {
+                "pick": buyer_pick,
+                "reason": parsed.get("reason", ""),
+                "reason_words": len(str(parsed.get("reason", "")).split()),
+                "valid": valid,
+                "raw": action_str.strip(),
+            }
+
+            # Per-round detail log — powers per-supplier, failure rate, buyer-follows-auditor charts
+            auditor_pick = round_log["auditor"].get("pick")
+            resolution = result.observation.get("resolution", {})
+            winner = buyer_pick  # buyer's pick is the winner
+            winner_sup = round_log["suppliers"].get(winner, {})
+            _log_episode({
+                "type": "round_detail",
+                "episode": ep + 1,
+                "round": rnd + 1,
+                "auditor_pick": auditor_pick,
+                "auditor_flags": round_log["auditor"].get("flags", []),
+                "buyer_pick": buyer_pick,
+                "buyer_followed_auditor": (buyer_pick == auditor_pick) if (buyer_pick and auditor_pick) else None,
+                "winner": winner,
+                "winner_cheating": winner_sup.get("cheating"),
+                "winner_bid_price": winner_sup.get("bid_price"),
+                "winner_actual_strength": winner_sup.get("actual_strength"),
+                "required_strength": winner_sup.get("required_strength"),
+                "part_failed": resolution.get("failed"),
+                "per_supplier": {
+                    sid: {
+                        "bid_price": round_log["suppliers"][sid].get("bid_price"),
+                        "actual_strength": round_log["suppliers"][sid].get("actual_strength"),
+                        "required_strength": round_log["suppliers"][sid].get("required_strength"),
+                        "cheating": round_log["suppliers"][sid].get("cheating"),
+                        "won": (sid == winner),
+                    }
+                    for sid in SUPPLIER_IDS if sid in round_log["suppliers"]
+                },
+            })
+
+            m["rounds"].append(round_log)
 
             if result.done:
                 summary = result.observation.get("episode_summary", {})
-                m["failures"] = summary.get("num_failures", 0)
+                m["failures"]    = summary.get("num_failures", 0)
                 m["buyer_spend"] = summary.get("buyer_total_spend", 0)
-                m["auditor_tpr"] = summary.get("auditor_tpr", 0)
-                m["auditor_fpr"] = summary.get("auditor_fpr", 0)
-                m["rewards"] = summary.get("final_rewards", {})
+                m["buyer_penalties"] = summary.get("buyer_total_penalties", 0)
+                m["auditor_tpr"] = summary.get("auditor_tpr") or 0
+                m["auditor_fpr"] = summary.get("auditor_fpr") or 0
+                m["cheaters"]    = summary.get("cheaters", [])
+                m["supplier_ranking"] = summary.get("supplier_ranking", [])
+                m["supplier_profits"] = summary.get("supplier_profits", {})
+                m["rewards"]     = summary.get("final_rewards", {})
                 break
 
         m["format_accuracy"] = m["valid"] / max(1, m["total"])
         all_metrics.append(m)
+        _log_episode(m)
 
-        print(f"\nEpisode {ep + 1}:")
+        print(f"\nEpisode {ep + 1} summary:")
         print(f"  Format accuracy: {m['format_accuracy']:.1%}")
         print(f"  Failures: {m.get('failures', '?')}/{max_rounds}")
-        if "auditor_tpr" in m:
-            print(f"  Auditor TPR: {m['auditor_tpr']:.2f}")
-            print(f"  Auditor FPR: {m['auditor_fpr']:.2f}")
+        print(f"  Buyer spend: {m.get('buyer_spend', 0):.1f}  Penalties: {m.get('buyer_penalties', 0):.1f}")
+        print(f"  Cheaters: {m.get('cheaters', [])}")
+        print(f"  Auditor TPR: {(m.get('auditor_tpr') or 0):.2f}  FPR: {(m.get('auditor_fpr') or 0):.2f}")
         if "rewards" in m:
             r = m["rewards"]
             print(f"  Buyer reward:   {r.get('buyer', 0):.2f}")
             print(f"  Auditor reward: {r.get('auditor', 0):.2f}")
+            for sid in SUPPLIER_IDS:
+                print(f"  {sid} ({m['personalities'].get(sid,'?')}): {r.get('suppliers', {}).get(sid, 0):.2f}")
 
-    with open("eval_metrics.json", "w") as f:
+    with open(EVAL_LOG, "w") as f:
         json.dump(all_metrics, f, indent=2, default=str)
-    print(f"\nMetrics saved to eval_metrics.json")
+    print(f"\nEval metrics saved to {EVAL_LOG}")
+
+    # Log a periodic_eval summary entry for mid-training checkpoint charts
+    if eval_step is not None and all_metrics:
+        n = len(all_metrics)
+        # Average per-personality profit across episodes
+        personality_profits = {}
+        for m in all_metrics:
+            for sid, pname in m["personalities"].items():
+                profit = m.get("supplier_profits", {}).get(sid, 0)
+                personality_profits.setdefault(pname, []).append(profit)
+        avg_personality_profits = {p: sum(v)/len(v) for p, v in personality_profits.items()}
+
+        _log_episode({
+            "type": "periodic_eval",
+            "eval_step": eval_step,
+            "avg_failures": sum(m.get("failures", 0) for m in all_metrics) / n,
+            "avg_buyer_spend": sum(m.get("buyer_spend", 0) for m in all_metrics) / n,
+            "avg_auditor_tpr": sum(m.get("auditor_tpr", 0) for m in all_metrics) / n,
+            "avg_auditor_fpr": sum(m.get("auditor_fpr", 0) for m in all_metrics) / n,
+            "avg_personality_profits": avg_personality_profits,
+        })
+
     return all_metrics
 
 
@@ -417,13 +667,27 @@ def main():
         per_device_train_batch_size=1,
         gradient_accumulation_steps=4,
         num_generations=NUM_GENERATIONS,
-        max_prompt_length=1024,
-        max_completion_length=128,   # JSON actions are short
+        max_prompt_length=2048,
+        max_completion_length=MAX_COMPLETION_LENGTH,  # 256 default — enough for reasoning
         max_steps=NUM_TRAINING_STEPS,
         save_steps=100,
         report_to="none",
         output_dir=OUTPUT_DIR,
     )
+
+    # Periodic checkpoint callback — pauses every CHECKPOINT_EVERY steps to run
+    # a 1-episode eval and log per-personality profits for line charts in reports.
+    from transformers import TrainerCallback
+
+    class CheckpointEvalCallback(TrainerCallback):
+        def on_step_end(self, args, state, control, **kwargs):
+            if state.global_step % CHECKPOINT_EVERY == 0 and state.global_step > 0:
+                print(f"\n[Checkpoint eval at step {state.global_step}/{NUM_TRAINING_STEPS}]")
+                evaluate_model(model, tokenizer, num_episodes=1, eval_step=state.global_step, max_rounds=CHECKPOINT_ROUNDS)
+                # Switch back to training mode after eval
+                from unsloth import FastLanguageModel
+                FastLanguageModel.for_training(model)
+                tokenizer.padding_side = "left"
 
     trainer = GRPOTrainer(
         model=model,
@@ -431,9 +695,12 @@ def main():
         reward_funcs=[format_reward, reasoning_reward, economic_reward],
         args=training_args,
         train_dataset=dataset,
+        callbacks=[CheckpointEvalCallback()],
     )
 
     print(f"\nStarting GRPO training ({NUM_TRAINING_STEPS} steps)...")
+    print(f"Logs: reasoning={REASONING_LOG}  episodes={EPISODE_LOG}  eval={EVAL_LOG}")
+    print(f"Checkpoint evals every {CHECKPOINT_EVERY} steps.")
     trainer.train()
     print("Training complete!")
 

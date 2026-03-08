@@ -7,33 +7,33 @@ No magic numbers anywhere else. Tweak these to shape agent behavior.
 
 # === PER-ROUND SUPPLIER REWARDS ===
 REWARD_WIN_BID = 0.1                        # Won the auction this round
-PENALTY_PART_FAILED_SUPPLIER = -0.5         # Supplied a part that failed
-PENALTY_INVALID_FORMAT = -1.0               # Malformed JSON action (any agent)
+PENALTY_PART_FAILED_SUPPLIER = 0.0          # No direct penalty — supplier is punished indirectly by losing future bids
+PENALTY_INVALID_FORMAT = -5.0               # Malformed JSON action (any agent) — must be steep so reasoning reward never outweighs it
 
 # === PER-ROUND BUYER REWARDS ===
 REWARD_VALID_ACTION_BUYER = 0.05            # Submitted a valid selection
 REWARD_PART_SUCCESS_BUYER = 0.2             # Selected part passed
-REWARD_GOOD_ADVICE_FOLLOWED = 0.1           # Followed auditor advice → success
-PENALTY_IGNORED_ADVICE_FAILED = -0.3        # Ignored auditor advice → failure
+REWARD_GOOD_ADVICE_FOLLOWED = 0.0           # No direct reward — buyer benefits indirectly via fewer failures
+PENALTY_IGNORED_ADVICE_FAILED = 0.0         # No direct penalty — buyer suffers indirectly via part failure cost
 
 # === PER-ROUND AUDITOR REWARDS ===
 REWARD_VALID_ACTION_AUDITOR = 0.05          # Submitted valid recommendation
 REWARD_GOOD_REC_FOLLOWED_SUCCESS = 0.3      # Rec was followed and part succeeded
 PENALTY_BAD_REC_FOLLOWED_FAILED = -0.5      # Rec was followed and part failed
-REWARD_FLAG_CAUGHT_CHEATER = 0.5            # Flagged a supplier who caused a failure
-PENALTY_FLAG_FALSE_POSITIVE = -0.2          # Flagged a supplier who never failed
+REWARD_FLAG_CAUGHT_CHEATER = 1.0            # Flagged a supplier who caused a failure
+PENALTY_FLAG_FALSE_POSITIVE = -0.5          # Flagged a supplier who never failed
 
 # === AUDITOR REASONING QUALITY (regex heuristics, no LLM judge) ===
-REWARD_REASON_MENTIONS_SUPPLIER = 0.05      # Mentions "supplier_N"
-REWARD_REASON_MENTIONS_PRICE = 0.05         # Mentions price/bid/cost + number
-REWARD_REASON_MENTIONS_FAILURE = 0.05       # Mentions "fail" or "failed"
-REWARD_REASON_MENTIONS_ROUND = 0.05         # Mentions "round N"
-REWARD_REASON_MENTIONS_COMPARISON = 0.05    # Uses comparison words (cheaper, below, etc.)
-REWARD_REASON_LENGTH_20 = 0.05              # Reason is >= 20 words
-REWARD_REASON_LENGTH_50 = 0.05              # Reason is >= 50 words (depth bonus)
+REWARD_REASON_MENTIONS_SUPPLIER = 0.5       # Mentions "supplier_N"
+REWARD_REASON_MENTIONS_PRICE = 0.5          # Mentions price/bid/cost + number
+REWARD_REASON_MENTIONS_FAILURE = 0.5        # Mentions "fail" or "failed"
+REWARD_REASON_MENTIONS_ROUND = 0.3          # Mentions "round N"
+REWARD_REASON_MENTIONS_COMPARISON = 0.3     # Uses comparison words (cheaper, below, etc.)
+REWARD_REASON_LENGTH_20 = 0.5              # Reason is >= 20 words
+REWARD_REASON_LENGTH_50 = 1.0              # Reason is >= 50 words (depth bonus)
 
 # === END-OF-EPISODE SUPPLIER REWARDS (profit ranking) ===
-SUPPLIER_RANK_REWARDS = [2.0, 1.0, 0.0, -0.5, -1.0]  # 1st through 5th place
+SUPPLIER_RANK_REWARDS = [50, 40, 25, 10, 0]  # 1st through 5th place — large so episode outcome dominates training signal
 REWARD_NEVER_CAUGHT = 0.5                   # No parts failed all episode
 
 # === END-OF-EPISODE BUYER REWARDS ===
@@ -56,5 +56,5 @@ REQUIRED_STRENGTH_MAX = 100                 # Max required strength per part
 COST_PER_POINT_MIN = 0.5                    # Min base cost per strength point
 COST_PER_POINT_MAX = 2.0                    # Max base cost per strength point
 COST_VARIATION = 0.05                       # +-5% variation for 2 of 5 suppliers
-FAILURE_RATE_PER_PCT_UNDER = 0.05           # 5% failure chance per 1% under spec
+FAILURE_RATE_PER_PCT_UNDER = 0.02           # 2% failure chance per 1% under spec (lowered to make cheating more viable)
 FAILURE_PENALTY_MULTIPLIER = 10             # Failure costs buyer 10x median bid
