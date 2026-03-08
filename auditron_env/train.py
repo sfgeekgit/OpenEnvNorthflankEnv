@@ -63,19 +63,18 @@ def build_prompt(obs: dict, agent_type: str) -> list[dict]:
     if "event_log" in obs_clean and len(obs_clean["event_log"]) > 5:
         obs_clean["event_log"] = obs_clean["event_log"][-5:]
 
-    return [
-        {
-            "role": "system",
-            "content": (
-                f"You are a {agent_type} in a procurement auction. {system}\n"
-                f"Respond with valid JSON only. Format: {action_format}"
-            ),
-        },
-        {
-            "role": "user",
-            "content": f"Current state:\n{json.dumps(obs_clean, indent=2)}",
-        },
-    ]
+    # Pre-format using Qwen ChatML template as a plain string.
+    # GRPOTrainer handles string prompts more reliably than message lists.
+    system_msg = (
+        f"You are a {agent_type} in a procurement auction. {system}\n"
+        f"Respond with valid JSON only. Format: {action_format}"
+    )
+    user_msg = f"Current state:\n{json.dumps(obs_clean, indent=2)}"
+    return (
+        f"<|im_start|>system\n{system_msg}<|im_end|>\n"
+        f"<|im_start|>user\n{user_msg}<|im_end|>\n"
+        f"<|im_start|>assistant\n"
+    )
 
 
 def generate_prompts(num_episodes: int) -> list[dict]:
@@ -388,6 +387,9 @@ def main():
     # 3. GRPO training
     from trl import GRPOConfig, GRPOTrainer
 
+    # Left-padding required for decoder-only models in GRPO
+    tokenizer.padding_side = "left"
+
     training_args = GRPOConfig(
         temperature=0.8,
         learning_rate=LEARNING_RATE,
@@ -399,8 +401,8 @@ def main():
         per_device_train_batch_size=1,
         gradient_accumulation_steps=4,
         num_generations=NUM_GENERATIONS,
-        max_prompt_length=MAX_SEQ_LENGTH // 2,
-        max_completion_length=MAX_SEQ_LENGTH // 2,
+        max_prompt_length=1024,
+        max_completion_length=128,   # JSON actions are short
         max_steps=NUM_TRAINING_STEPS,
         save_steps=100,
         report_to="none",
