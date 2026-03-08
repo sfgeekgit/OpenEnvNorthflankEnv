@@ -6,6 +6,7 @@ Model must learn to output 'a' then 'z' to get max reward.
 Model name is a config variable so it's easy to swap dev (0.5B) for prod (7-8B).
 """
 
+import os
 import re
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -17,7 +18,7 @@ from server import LetterAction, LetterEnv
 MODEL_NAME = "Qwen/Qwen2-0.5B"
 NUM_EPISODES = 10
 MAX_STEPS_PER_EPISODE = 10
-HF_TOKEN_FILE = "/home/openenv/HFTOKEN"
+HF_TOKEN_FILE = os.environ.get("HF_TOKEN_FILE", "/home/openenv/HFTOKEN")
 # ─────────────────────────────────────────────────────────────────────────────
 
 
