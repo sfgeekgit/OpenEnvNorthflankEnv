@@ -702,6 +702,10 @@ def main():
         output_dir=OUTPUT_DIR,
     )
 
+    # Patch missing attribute — some trl versions expect this on the model object
+    if not hasattr(model, "warnings_issued"):
+        model.warnings_issued = {}
+
     trainer = GRPOTrainer(
         model=model,
         processing_class=tokenizer,
