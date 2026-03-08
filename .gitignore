@@ -1,0 +1,4 @@
+HFTOKEN
+__pycache__/
+*.pyc
+.env
