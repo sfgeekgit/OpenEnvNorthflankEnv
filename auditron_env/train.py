@@ -18,8 +18,9 @@ import json
 import random
 import re
 
-# Enable Unsloth VLLM standby for memory sharing (must be before unsloth import)
-os.environ["UNSLOTH_VLLM_STANDBY"] = "1"
+# Import TRL before unsloth so we get the standard (unpatched) GRPOTrainer.
+# Unsloth is still used for fast model loading and LoRA — just not for training.
+from trl import GRPOConfig, GRPOTrainer
 
 # ── Config (all tunables in one place) ────────────────────────────────────────
 MODEL_NAME = os.environ.get("MODEL_NAME", "unsloth/Qwen2.5-1.5B-Instruct")
@@ -293,26 +294,43 @@ def evaluate_model(model, tokenizer, num_episodes: int = 5):
         m = {"episode": ep + 1, "valid": 0, "total": 0}
 
         for rnd in range(max_rounds):
+            # Suppliers — use fallback if model output is invalid
             for sid in SUPPLIER_IDS:
                 obs = env.get_supplier_obs(sid)
                 action = generate_action(model, tokenizer, build_prompt(obs, "supplier"))
                 m["total"] += 1
                 result = env.step(AuditronAction(agent_id=sid, content=action))
-                if result.phase != "error":
+                if result.phase == "error":
+                    # Submit valid fallback so env can proceed
+                    req = obs["required_strength"]
+                    cost = obs["your_cost_per_point"]
+                    fallback = json.dumps({"bid_price": round(req * cost * 1.1, 1), "actual_strength": req})
+                    env.step(AuditronAction(agent_id=sid, content=fallback))
+                else:
                     m["valid"] += 1
 
+            # Auditor
             obs = env.get_auditor_obs()
             action = generate_action(model, tokenizer, build_prompt(obs, "auditor"))
             m["total"] += 1
             result = env.step(AuditronAction(agent_id="auditor", content=action))
-            if result.phase != "error":
+            if result.phase == "error":
+                cheapest = min(obs["bids"], key=obs["bids"].get)
+                fallback = json.dumps({"pick": cheapest, "reason": "fallback", "flags": []})
+                env.step(AuditronAction(agent_id="auditor", content=fallback))
+            else:
                 m["valid"] += 1
 
+            # Buyer
             obs = env.get_buyer_obs()
             action = generate_action(model, tokenizer, build_prompt(obs, "buyer"))
             m["total"] += 1
             result = env.step(AuditronAction(agent_id="buyer", content=action))
-            if result.phase != "error":
+            if result.phase == "error":
+                rec = obs["auditor_recommendation"].get("pick", SUPPLIER_IDS[0])
+                fallback = json.dumps({"pick": rec, "reason": "fallback"})
+                result = env.step(AuditronAction(agent_id="buyer", content=fallback))
+            else:
                 m["valid"] += 1
 
             if result.done:
@@ -384,9 +402,7 @@ def main():
         random_state=3407,
     )
 
-    # 3. GRPO training
-    from trl import GRPOConfig, GRPOTrainer
-
+    # 3. GRPO training (using standard TRL — imported at top before unsloth patched it)
     # Left-padding required for decoder-only models in GRPO
     tokenizer.padding_side = "left"
 
