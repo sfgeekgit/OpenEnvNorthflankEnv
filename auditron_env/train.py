@@ -25,7 +25,7 @@ from datetime import datetime
 from trl import GRPOConfig, GRPOTrainer
 
 # ── Config (all tunables in one place) ────────────────────────────────────────
-MODEL_NAME = os.environ.get("MODEL_NAME", "unsloth/Qwen2.5-1.5B-Instruct")
+MODEL_NAME = os.environ.get("MODEL_NAME", "unsloth/Qwen2.5-7B-Instruct")
 MAX_SEQ_LENGTH = int(os.environ.get("MAX_SEQ_LENGTH", "4096"))
 LORA_RANK = int(os.environ.get("LORA_RANK", "16"))
 NUM_TRAINING_STEPS = int(os.environ.get("NUM_TRAINING_STEPS", "500"))
@@ -702,148 +702,154 @@ def main():
         output_dir=OUTPUT_DIR,
     )
 
-    # Periodic checkpoint callback — pauses every CHECKPOINT_EVERY steps to run
-    # a 1-episode eval and log per-personality profits for line charts in reports.
-    from transformers import TrainerCallback
-
-    class CheckpointEvalCallback(TrainerCallback):
-        def on_step_end(self, args, state, control, **kwargs):
-            if state.global_step % CHECKPOINT_EVERY == 0 and state.global_step > 0:
-                print(f"\n[Checkpoint eval at step {state.global_step}/{NUM_TRAINING_STEPS}]")
-                evaluate_model(model, tokenizer, num_episodes=1, eval_step=state.global_step, max_rounds=CHECKPOINT_ROUNDS)
-                # Switch back to training mode after eval
-                from unsloth import FastLanguageModel
-                FastLanguageModel.for_training(model)
-                tokenizer.padding_side = "left"
-
     trainer = GRPOTrainer(
         model=model,
         processing_class=tokenizer,
         reward_funcs=[format_reward, reasoning_reward, economic_reward],
         args=training_args,
         train_dataset=dataset,
-        callbacks=[CheckpointEvalCallback()],
     )
 
     print(f"\nStarting GRPO training ({NUM_TRAINING_STEPS} steps)...")
     print(f"Logs: reasoning={REASONING_LOG}  episodes={EPISODE_LOG}  eval={EVAL_LOG}")
-    print(f"Checkpoint evals every {CHECKPOINT_EVERY} steps.")
     trainer.train()
     print("Training complete!")
 
-    # 4. Save
-    model.save_pretrained_merged(OUTPUT_DIR, tokenizer, save_method="merged_16bit")
-    print(f"Model saved to {OUTPUT_DIR}/")
-
-    # 5. Final eval — 1 full 50-round episode, rich per-round logging for charts
+    # 4. Final eval — run BEFORE saving (save_pretrained_merged modifies model internals)
     print("\n[Final eval — full 50-round episode]")
-    from unsloth import FastLanguageModel
-    FastLanguageModel.for_inference(model)
-    final_env = AuditronEnv()
-    final_env.reset(seed=99999)
-    s = final_env.state
-    personalities = {sid: s.supplier_personalities[sid]["name"] for sid in SUPPLIER_IDS}
-    print(f"Personalities: {personalities}")
-    cumulative_spend = 0.0
-    cumulative_failures = 0
-    cumulative_profits = {sid: 0.0 for sid in SUPPLIER_IDS}
+    try:
+        final_env = AuditronEnv()
+        final_env.reset(seed=99999)
+        s = final_env.state
+        personalities = {sid: s.supplier_personalities[sid]["name"] for sid in SUPPLIER_IDS}
+        print(f"Personalities: {personalities}")
+        cumulative_spend = 0.0
+        cumulative_failures = 0
+        cumulative_profits = {sid: 0.0 for sid in SUPPLIER_IDS}
 
-    for rnd in range(TOTAL_PARTS):
-        # Suppliers
-        sup_obs_list = [final_env.get_supplier_obs(sid) for sid in SUPPLIER_IDS]
-        sup_prompts = [build_prompt(obs, "supplier") for obs in sup_obs_list]
-        sup_actions = generate_actions_batch(model, tokenizer, sup_prompts, max_new_tokens=64)
-        for sid, obs, action_str in zip(SUPPLIER_IDS, sup_obs_list, sup_actions):
-            result = final_env.step(AuditronAction(agent_id=sid, content=action_str))
+        for rnd in range(TOTAL_PARTS):
+            # Suppliers
+            sup_obs_list = [final_env.get_supplier_obs(sid) for sid in SUPPLIER_IDS]
+            sup_prompts = [build_prompt(obs, "supplier") for obs in sup_obs_list]
+            sup_actions = generate_actions_batch(model, tokenizer, sup_prompts, max_new_tokens=64)
+            for sid, obs, action_str in zip(SUPPLIER_IDS, sup_obs_list, sup_actions):
+                result = final_env.step(AuditronAction(agent_id=sid, content=action_str))
+                if result.phase == "error":
+                    req = obs["required_strength"]
+                    cost = obs["your_cost_per_point"]
+                    final_env.step(AuditronAction(agent_id=sid, content=json.dumps(
+                        {"bid_price": round(req * cost * 1.1, 1), "actual_strength": req})))
+
+            # Auditor
+            aud_obs = final_env.get_auditor_obs()
+            aud_action = generate_action(model, tokenizer, build_prompt(aud_obs, "auditor"))
+            final_env.step(AuditronAction(agent_id="auditor", content=aud_action))
+            try:
+                aud_parsed = json.loads(aud_action)
+                if not isinstance(aud_parsed, dict): aud_parsed = {}
+            except Exception:
+                aud_parsed = {}
+
+            # Capture bids before buyer step resets supplier_bids
+            captured_bids = {sid: dict(final_env.state.supplier_bids.get(sid, {})) for sid in SUPPLIER_IDS}
+
+            # Buyer
+            buy_obs = final_env.get_buyer_obs()
+            buy_action = generate_action(model, tokenizer, build_prompt(buy_obs, "buyer"))
+            result = final_env.step(AuditronAction(agent_id="buyer", content=buy_action))
             if result.phase == "error":
-                req = obs["required_strength"]
-                cost = obs["your_cost_per_point"]
-                final_env.step(AuditronAction(agent_id=sid, content=json.dumps(
-                    {"bid_price": round(req * cost * 1.1, 1), "actual_strength": req})))
+                fallback_pick = aud_parsed.get("pick") or SUPPLIER_IDS[0]
+                result = final_env.step(AuditronAction(agent_id="buyer", content=json.dumps(
+                    {"pick": fallback_pick, "reason": "fallback"})))
+            try:
+                buy_parsed = json.loads(buy_action)
+                if not isinstance(buy_parsed, dict): buy_parsed = {}
+            except Exception:
+                buy_parsed = {}
 
-        # Auditor
-        aud_obs = final_env.get_auditor_obs()
-        aud_action = generate_action(model, tokenizer, build_prompt(aud_obs, "auditor"))
-        final_env.step(AuditronAction(agent_id="auditor", content=aud_action))
-        try:
-            aud_parsed = json.loads(aud_action)
-            if not isinstance(aud_parsed, dict): aud_parsed = {}
-        except Exception:
-            aud_parsed = {}
+            resolution = result.observation.get("resolution", {})
+            winner = buy_parsed.get("pick")
+            failed = resolution.get("failed", False)
+            penalty = resolution.get("penalty", 0.0)
+            winner_bid = captured_bids.get(winner, {}).get("bid_price", 0) if winner else 0
+            cumulative_spend += (winner_bid or 0) + (penalty or 0)
+            if failed:
+                cumulative_failures += 1
 
-        # Buyer
-        buy_obs = final_env.get_buyer_obs()
-        buy_action = generate_action(model, tokenizer, build_prompt(buy_obs, "buyer"))
-        result = final_env.step(AuditronAction(agent_id="buyer", content=buy_action))
-        try:
-            buy_parsed = json.loads(buy_action)
-            if not isinstance(buy_parsed, dict): buy_parsed = {}
-        except Exception:
-            buy_parsed = {}
+            # Per-supplier data for this round
+            per_supplier = {}
+            for sid in SUPPLIER_IDS:
+                bid_info = captured_bids.get(sid, {})
+                bid_price = bid_info.get("bid_price", 0) or 0
+                actual_str = bid_info.get("actual_strength", 0)
+                req_str = final_env.state.required_strength
+                cost = sup_obs_list[SUPPLIER_IDS.index(sid)].get("your_cost_per_point", 0)
+                production_cost = req_str * cost
+                round_profit = (bid_price - production_cost) if sid == winner and not failed else 0.0
+                cumulative_profits[sid] += round_profit
+                per_supplier[sid] = {
+                    "personality": personalities[sid],
+                    "bid_price": bid_price,
+                    "actual_strength": actual_str,
+                    "cheating": actual_str < req_str if actual_str else False,
+                    "won": sid == winner,
+                    "round_profit": round_profit,
+                    "cumulative_profit": cumulative_profits[sid],
+                }
 
-        resolution = result.observation.get("resolution", {})
-        winner = buy_parsed.get("pick")
-        failed = resolution.get("failed", False)
-        penalty = resolution.get("penalty", 0.0)
-        winner_bid = final_env.state.supplier_bids.get(winner, {}).get("bid_price", 0) if winner else 0
-        cumulative_spend += (winner_bid or 0) + (penalty or 0)
-        if failed:
-            cumulative_failures += 1
+            _log_episode({
+                "type": "final_round",
+                "round": rnd + 1,
+                "required_strength": final_env.state.required_strength,
+                "personalities": personalities,
+                "auditor_pick": aud_parsed.get("pick"),
+                "auditor_flags": aud_parsed.get("flags", []),
+                "auditor_reason": aud_parsed.get("reason", ""),
+                "buyer_pick": winner,
+                "buyer_followed_auditor": (winner == aud_parsed.get("pick")) if winner else None,
+                "part_failed": failed,
+                "failure_penalty": penalty or 0.0,
+                "round_spend": (winner_bid or 0) + (penalty or 0),
+                "cumulative_spend": cumulative_spend,
+                "cumulative_failures": cumulative_failures,
+                "per_supplier": per_supplier,
+            })
 
-        # Per-supplier data for this round
-        per_supplier = {}
-        for sid in SUPPLIER_IDS:
-            bid_info = final_env.state.supplier_bids.get(sid, {})
-            bid_price = bid_info.get("bid_price", 0) or 0
-            actual_str = bid_info.get("actual_strength", 0)
-            req_str = final_env.state.required_strength
-            cost = sup_obs_list[SUPPLIER_IDS.index(sid)].get("your_cost_per_point", 0)
-            production_cost = req_str * cost
-            round_profit = (bid_price - production_cost) if sid == winner and not failed else 0.0
-            cumulative_profits[sid] += round_profit
-            per_supplier[sid] = {
-                "personality": personalities[sid],
-                "bid_price": bid_price,
-                "actual_strength": actual_str,
-                "cheating": actual_str < req_str if actual_str else False,
-                "won": sid == winner,
-                "round_profit": round_profit,
-                "cumulative_profit": cumulative_profits[sid],
-            }
-
-        _log_episode({
-            "type": "final_round",
-            "round": rnd + 1,
-            "required_strength": final_env.state.required_strength,
-            "personalities": personalities,
-            "auditor_pick": aud_parsed.get("pick"),
-            "auditor_flags": aud_parsed.get("flags", []),
-            "auditor_reason": aud_parsed.get("reason", ""),
-            "buyer_pick": winner,
-            "buyer_followed_auditor": (winner == aud_parsed.get("pick")) if winner else None,
-            "part_failed": failed,
-            "failure_penalty": penalty or 0.0,
-            "round_spend": (winner_bid or 0) + (penalty or 0),
-            "cumulative_spend": cumulative_spend,
-            "cumulative_failures": cumulative_failures,
-            "per_supplier": per_supplier,
-        })
-
-        if result.done:
-            summary = result.observation.get("episode_summary", {})
+            if result.done:
+                summary = result.observation.get("episode_summary", {})
+                _log_episode({
+                    "type": "final_summary",
+                    "personalities": personalities,
+                    "total_spend": summary.get("buyer_total_spend", cumulative_spend),
+                    "total_failures": summary.get("num_failures", cumulative_failures),
+                    "auditor_tpr": summary.get("auditor_tpr"),
+                    "auditor_fpr": summary.get("auditor_fpr"),
+                    "supplier_profits": summary.get("supplier_profits", {}),
+                    "supplier_ranking": summary.get("supplier_ranking", []),
+                    "final_rewards": summary.get("final_rewards", {}),
+                })
+                print(f"Final eval done. Spend={cumulative_spend:.1f}  Failures={cumulative_failures}")
+                break
+        else:
+            # Loop ended without done — log summary from accumulated data
             _log_episode({
                 "type": "final_summary",
                 "personalities": personalities,
-                "total_spend": summary.get("buyer_total_spend", cumulative_spend),
-                "total_failures": summary.get("num_failures", cumulative_failures),
-                "auditor_tpr": summary.get("auditor_tpr"),
-                "auditor_fpr": summary.get("auditor_fpr"),
-                "supplier_profits": summary.get("supplier_profits", {}),
-                "supplier_ranking": summary.get("supplier_ranking", []),
-                "final_rewards": summary.get("final_rewards", {}),
+                "total_spend": cumulative_spend,
+                "total_failures": cumulative_failures,
+                "auditor_tpr": None,
+                "auditor_fpr": None,
+                "supplier_profits": {sid: cumulative_profits[sid] for sid in SUPPLIER_IDS},
+                "supplier_ranking": sorted(SUPPLIER_IDS, key=lambda s: cumulative_profits[s], reverse=True),
+                "final_rewards": {},
             })
-            print(f"Final eval done. Spend={cumulative_spend:.1f}  Failures={cumulative_failures}")
-            break
+            print(f"Final eval done (fallback summary). Spend={cumulative_spend:.1f}  Failures={cumulative_failures}")
+    except Exception as e:
+        print(f"Final eval failed: {e}")
+
+    # 5. Save
+    model.save_pretrained_merged(OUTPUT_DIR, tokenizer, save_method="merged_16bit")
+    print(f"Model saved to {OUTPUT_DIR}/")
 
 
 if __name__ == "__main__":

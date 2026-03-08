@@ -304,6 +304,12 @@ class AuditronEnv(Environment[AuditronAction, AuditronObservation, AuditronState
                 'Example: {"bid_price": 85, "actual_strength": 75}',
             )
 
+        # Clamp bid to at least production cost — penalize if model bid below it
+        production_cost = s.required_strength * s.supplier_costs.get(agent_id, 0)
+        if bid_price < production_cost:
+            s.supplier_rewards[agent_id] += PENALTY_INVALID_FORMAT / 2  # -2.5
+            bid_price = production_cost  # clamp so game math stays valid
+
         s.supplier_bids[agent_id] = {
             "bid_price": bid_price,
             "actual_strength": actual_strength,
