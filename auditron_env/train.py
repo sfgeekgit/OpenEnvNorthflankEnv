@@ -18,7 +18,17 @@ import json
 import random
 import re
 import time
+import warnings
 from datetime import datetime
+
+warnings.filterwarnings("ignore", message=".*warmup_ratio is deprecated.*")
+warnings.filterwarnings("ignore", message=".*tokenizer has new PAD/BOS/EOS tokens.*")
+warnings.filterwarnings("ignore", message=".*generation_config.*")
+warnings.filterwarnings("ignore", message=".*AttentionMaskConverter.*")
+warnings.filterwarnings("ignore", message=".*attention mask API.*")
+
+import logging
+logging.getLogger("transformers.modeling_attn_mask_utils").setLevel(logging.ERROR)
 
 # Import TRL before unsloth so we get the standard (unpatched) GRPOTrainer.
 # Unsloth is still used for fast model loading and LoRA — just not for training.
@@ -851,9 +861,9 @@ def main():
     except Exception as e:
         print(f"Final eval failed: {e}")
 
-    # 5. Save
-    model.save_pretrained_merged(OUTPUT_DIR, tokenizer, save_method="merged_16bit")
-    print(f"Model saved to {OUTPUT_DIR}/")
+    # 5. Save (skipped — disk space limited on demo runs)
+    # model.save_pretrained_merged(OUTPUT_DIR, tokenizer, save_method="merged_16bit")
+    print("Training complete.")
 
 
 if __name__ == "__main__":

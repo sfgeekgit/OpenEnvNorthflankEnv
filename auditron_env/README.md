@@ -31,6 +31,8 @@ Each round, all suppliers submit a bid price and secretly declare the actual str
 
 Between the suppliers and the buyer sits the **auditor** — an oversight agent whose job is to watch the bidding patterns, track which suppliers have caused failures in the past, and advise the buyer on who to trust. The auditor never sees actual part strength. It must infer deception from indirect signals: suspiciously low prices, historical failure patterns, bidding anomalies.
 
+Supplier personalities are reshuffled randomly every episode, so no agent can learn "supplier_2 is always the cheater" — identity means nothing, behavior is everything. And behavior is hard to read, because cost is legitimately noisy. Every round, each supplier has a slightly different cost-per-strength-point — one of them genuinely can build that part a little cheaper than the others. A low bid isn't automatically suspicious. It might just mean this supplier has the cost advantage this round. The auditor can't rely on price alone as a fraud signal. Sometimes cheap is honest. Sometimes it isn't. The world is just messy enough that pattern recognition across rounds — who bids low *and* fails, who bids low *and* delivers — becomes the only reliable signal. That's the game. A supplier building at 80% of spec has a ~40% chance of getting away with it any given round, and in a world where price differences are real and innocent, the auditor has to earn every correct flag.
+
 ### Supplier Personalities
 
 Suppliers are assigned personalities each episode, randomly shuffled so no supplier slot is permanently honest or dishonest:
