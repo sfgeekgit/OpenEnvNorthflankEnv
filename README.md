@@ -1,4 +1,10 @@
-# Auditron · OpenEnv · Training Report
+# Auditron · OpenEnv
+
+## 🏆 Hackathon Submission — March 2026
+
+This project was built for the OpenEnv Hackathon SF (March 2026). **[View the interactive notebook on Google Colab](https://colab.research.google.com/drive/172BW3iSEKZN0T07OMqxSOFDk_ElwqOeu)** — it includes the full training pipeline and results visualization.
+
+---
 
 ## The Auditor Learns to Spot Fraud
 
