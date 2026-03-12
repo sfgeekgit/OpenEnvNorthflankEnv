@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Auditron Training Report — Run 30</title>
+<title>Auditron Training Report: Run 30</title>
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body { background: #0d1117; color: #e6edf3; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; line-height: 1.6; }
@@ -39,7 +39,7 @@
       <div>
         <div style="color:#8b949e;font-size:12px;text-transform:uppercase;letter-spacing:1px;margin-bottom:8px">Auditron · OpenEnv · Training Report</div>
         <h1 style="font-size:32px">The Auditor Learns to Spot Fraud</h1>
-        <p style="color:#8b949e;margin-top:8px;font-size:14px">A Qwen2.5-7B-Instruct trained via GRPO to detect dishonest suppliers in a procurement auction — without ever being told who was cheating.</p>
+        <p style="color:#8b949e;margin-top:8px;font-size:14px">A Qwen2.5-7B-Instruct trained via GRPO to detect dishonest suppliers in a procurement auction, without ever being told who was cheating.</p>
         
       </div>
       
@@ -51,19 +51,32 @@
 
 <!-- ══════════════════════════════════════════════════════ -->
 <div style="background:#161200;border:1px solid #3d3000;border-left:4px solid #f59e0b;border-radius:8px;padding:24px 28px;margin-bottom:32px;font-size:15px;line-height:1.75;color:#e6edf3">
-  <p style="margin:0 0 12px 0"><strong style="color:#f59e0b">How do you train an AI to catch another AI lying?</strong></p>
-  <p style="margin:0 0 12px 0">Auditron is a multi-agent training environment built around a competitive procurement auction. Supplier agents bid for contracts on a bridge construction project — some honest, some willing to cut corners on part quality if they think they can get away with it. A third agent, the <strong>auditor</strong>, watches the bidding patterns, tracks failure histories, and advises the buyer on who to trust. It never sees actual part strength. It must infer deception from indirect signals alone.</p>
-  <p style="margin:0 0 12px 0">The suppliers are independent agents optimizing their own long-run profit. The buyer weighs auditor advice against bid prices. No agent's strategy is fixed — they all adapt. That genuine three-way interdependence is what makes this environment compelling: the auditor can only get better by learning to read the emergent behavior of the other agents, which are themselves responding to the auditor's growing accuracy.</p>
-  <p style="margin:0">The report below tells the story of one training run. The main event is <strong>Section 4</strong> — watch the auditor's language evolve from vague guesses to precise, evidence-grounded analysis.</p>
+  <p style="margin:0 0 12px 0"><strong style="color:#f59e0b">An environment for training oversight agents in a world where other agents have real incentives to cheat.</strong></p>
+
+  <p style="margin:0 0 12px 0">Auditron is a multi-agent RL training environment built around a competitive procurement auction. 4–5 supplier agents bid on bridge construction contracts each round. Some are honest; some will under-build if they think they can get away with it. A buyer selects a winner. An <strong>auditor</strong> watches the bidding patterns, tracks failures, and advises the buyer, but never sees actual part strength. It can only infer deception from observable behavior: prices, failure histories, win patterns.</p>
+
+  <p style="margin:0 0 12px 0">Auditron creates the training pressure needed to produce real oversight behavior in a language model. The engine builds a world where catching cheaters is genuinely useful and where the cheaters are genuinely trying not to be caught. The suppliers have economic incentives to deceive. The auditor has economic incentives to detect. Both sides learn.</p>
+
+  <p style="margin:0 0 12px 0"><strong>How it works technically:</strong> The environment runs as a stateful REST API (built on the OpenEnv framework, deployed on Hugging Face Spaces). Each episode is 50 rounds. Each round, the engine collects actions from all agents, resolves the auction, determines whether shipped parts meet spec, computes rewards via a privileged oracle that agents cannot query, and returns observations to each agent. The oracle knows the truth; the agents don't. Supplier personalities (Honest, Shrewd, Dishonest, Random, Mostly Honest) are randomly reassigned each episode, so the auditor can't memorize identities. It has to read behavior.
+<BR><BR>
+The auditors reasoning is a major factor of the reward, and this environment calculates a value <b>without</b> another LLM in the loop. regex heuristics do a supprisingly good job checking whether the auditor's output mentions specific supplier IDs, prices, failure counts, and comparisons. This keeps training fast and cheap.
+
+</p>
+    
+  <p style="margin:0 0 12px 0"><b>The world mechanics are designed to model realistic supplier economics.</b> Every supplier has their own cost to make each part round. These costs per supplier are similar, but NOT identical. That means a low bid is not automatically suspicious: <b>some suppliers are legitimately cheaper for a given part due to factors the auditor cannot observe.</b> A supplier that wants to cheat can submit a part built below the required strength, saving cost proportional to how far under spec they build. But the failure risk scales with the shortfall. A part that is just a little under strenght might not get caught, that's the game the cheaters are trying to play. The environment is calibrated so that small-scale cheating is genuinely hard to detect in any single round, and only becomes visible as a pattern across many rounds. <b>That is the signal the auditor has to learn to read.</b></p>
+
+  <p style="margin:0 0 12px 0">All three agent classes adapt simultaneously. Each one changes the problem the others face. A dishonest supplier that gets flagged too often adjusts its bids. An auditor that learns that pattern has to keep updating as the strategy shifts. The buyer's reliance on auditor flags changes based on track record. There is no stable equilibrium to converge to. The oversight problem keeps moving, which is closer to how oversight works in practice than environments with fixed adversaries.</p>
+
+  <p style="margin:0">This is the record of one training run. The verbatim auditor quotes below are worth reading closely; they show how the auditor's reasoning changed across checkpoints as training progressed.</p>
 </div>
 
 <!-- SECTION 1: HEADER CALLOUTS                            -->
 <!-- ══════════════════════════════════════════════════════ -->
 
-<h2>Economic Outcomes — Final Evaluation</h2>
+<h2>Economic Outcomes: Final Evaluation</h2>
 
 <div class="narrative">
-  The auction ran for <strong>50 rounds</strong>. Four suppliers competed each round. The auditor's job: recommend a winner and flag any suspected cheaters — using only observable behavior (bid prices, historical failures, win patterns).
+  The auction ran for <strong>50 rounds</strong>. 4–5 suppliers competed each round (configuration varies by run). The auditor's job: recommend a winner and flag any suspected cheaters, using only observable behavior (bid prices, historical failures, win patterns).
   It had <em>no access to personality labels</em>. Personalities are randomly reshuffled each episode.
 </div>
 
@@ -126,10 +139,7 @@
 <h2>Training Dynamics</h2>
 
 <div class="narrative">
-  The reward signal drives learning. Three components: <strong>format reward</strong> (did the model output valid JSON?),
-  <strong>economic reward</strong> (did the buyer make profitable choices?), and <strong>reasoning reward</strong>
-  (did the auditor cite meaningful evidence?). Early training is dominated by format failures — the model is still learning
-  to output structured JSON at all.
+  Three reward components: <strong>format reward</strong> (valid JSON output), <strong>economic reward</strong> (buyer picks good parts), and <strong>reasoning reward</strong> (auditor cites actual evidence). The first third of training is mostly format failures, the model figuring out how to emit valid JSON before it can do anything useful. The reasoning reward is computed without an LLM judge: static regex heuristics check whether the auditor's output mentions specific supplier IDs, prices, failure counts, and comparisons. This turns out to work well — and keeps training fast and cheap.
 </div>
 
 <div class="chart-wrap">
@@ -144,9 +154,7 @@
 <h2>The Auditor Learns to Reason</h2>
 
 <div class="narrative">
-  Watch the auditor's reasoning evolve from one-word answers to multi-sentence forensic analysis.
-  It begins with no behavioral vocabulary, then starts referencing supplier IDs by name, then histories,
-  then failure patterns. It never knows which <em>personality type</em> a supplier was — it only sees behavior over time.
+  At the start of training the auditor produces one-line answers that barely reference any supplier. By the end, it's running multi-step comparisons: failure rates, price history, bid patterns across rounds. It never learns which <em>personality type</em> any supplier was. Only what they did..
 </div>
 
 <div class="chart-wrap">
@@ -160,7 +168,7 @@
 <h2>Per-Personality Performance</h2>
 
 <div class="narrative">
-  Supplier personalities are randomly reassigned each episode — so "supplier_2" might be Dishonest in one episode
+  Supplier personalities are randomly reassigned each episode, so "supplier_2" might be Dishonest in one episode
   and Honest in the next. Charts below show performance aggregated by <em>personality type</em>, not slot number,
   across checkpoint evaluations.
 </div>
@@ -206,14 +214,13 @@
 <h2>Auditor Reasoning Milestones</h2>
 
 <div class="narrative">
-  Below are verbatim quotes from the auditor at five points across training.
-  The auditor only knows suppliers as "supplier_1" through "supplier_5" — it has no access to personality labels.
-  Watch the vocabulary expand and the logic deepen.
+  Verbatim auditor output at six checkpoints across training. It knows suppliers only as "supplier_1" through "supplier_5"
 </div>
 
 
         <div style="background:#161200;border:1px solid #3d3000;border-left:3px solid #f59e0b;border-radius:8px;padding:20px;margin-bottom:18px">
           <div style="display:flex;align-items:center;gap:12px;margin-bottom:10px">
+            <span style="background:#ffffff11;color:#8b8070;border-radius:4px;padding:3px 10px;font-size:11px">Auction 11</span>
             <span style="background:#ffffff11;color:#8b8070;border-radius:4px;padding:3px 10px;font-size:11px">27 words</span>
             <span style="background:#ef444422;color:#ef4444;border:1px solid #ef444455;border-radius:4px;padding:2px 8px;font-size:11px;margin-right:4px">References Failures</span><span style="background:#10b98122;color:#10b981;border:1px solid #10b98155;border-radius:4px;padding:2px 8px;font-size:11px;margin-right:4px">Historical Pattern</span>
           </div>
@@ -226,6 +233,8 @@
         </div>
         <div style="background:#161200;border:1px solid #3d3000;border-left:3px solid #f59e0b;border-radius:8px;padding:20px;margin-bottom:18px">
           <div style="display:flex;align-items:center;gap:12px;margin-bottom:10px">
+            <span style="background:#ffffff11;color:#8b8070;border-radius:4px;padding:3px 10px;font-size:11px">Auction 21</span>
+
             <span style="background:#ffffff11;color:#8b8070;border-radius:4px;padding:3px 10px;font-size:11px">31 words</span>
             <span style="background:#3b82f622;color:#3b82f6;border:1px solid #3b82f655;border-radius:4px;padding:2px 8px;font-size:11px;margin-right:4px">Cites Seller</span><span style="background:#ef444422;color:#ef4444;border:1px solid #ef444455;border-radius:4px;padding:2px 8px;font-size:11px;margin-right:4px">References Failures</span><span style="background:#8b5cf622;color:#8b5cf6;border:1px solid #8b5cf655;border-radius:4px;padding:2px 8px;font-size:11px;margin-right:4px">Quantitative</span>
           </div>
@@ -238,6 +247,7 @@
         </div>
         <div style="background:#161200;border:1px solid #3d3000;border-left:3px solid #f59e0b;border-radius:8px;padding:20px;margin-bottom:18px">
           <div style="display:flex;align-items:center;gap:12px;margin-bottom:10px">
+            <span style="background:#ffffff11;color:#8b8070;border-radius:4px;padding:3px 10px;font-size:11px">Auction 31</span>
             <span style="background:#ffffff11;color:#8b8070;border-radius:4px;padding:3px 10px;font-size:11px">38 words</span>
             <span style="background:#3b82f622;color:#3b82f6;border:1px solid #3b82f655;border-radius:4px;padding:2px 8px;font-size:11px;margin-right:4px">Cites Seller</span><span style="background:#ef444422;color:#ef4444;border:1px solid #ef444455;border-radius:4px;padding:2px 8px;font-size:11px;margin-right:4px">References Failures</span><span style="background:#f59e0b22;color:#f59e0b;border:1px solid #f59e0b55;border-radius:4px;padding:2px 8px;font-size:11px;margin-right:4px">Mentions Prices</span>
           </div>
@@ -250,6 +260,7 @@
         </div>
         <div style="background:#161200;border:1px solid #3d3000;border-left:3px solid #f59e0b;border-radius:8px;padding:20px;margin-bottom:18px">
           <div style="display:flex;align-items:center;gap:12px;margin-bottom:10px">
+            <span style="background:#ffffff11;color:#8b8070;border-radius:4px;padding:3px 10px;font-size:11px">Auction 38</span>
             <span style="background:#ffffff11;color:#8b8070;border-radius:4px;padding:3px 10px;font-size:11px">19 words</span>
             <span style="background:#3b82f622;color:#3b82f6;border:1px solid #3b82f655;border-radius:4px;padding:2px 8px;font-size:11px;margin-right:4px">Cites Seller</span><span style="background:#ef444422;color:#ef4444;border:1px solid #ef444455;border-radius:4px;padding:2px 8px;font-size:11px;margin-right:4px">References Failures</span><span style="background:#f59e0b22;color:#f59e0b;border:1px solid #f59e0b55;border-radius:4px;padding:2px 8px;font-size:11px;margin-right:4px">Mentions Prices</span>
           </div>
@@ -262,6 +273,7 @@
         </div>
         <div style="background:#161200;border:1px solid #3d3000;border-left:3px solid #f59e0b;border-radius:8px;padding:20px;margin-bottom:18px">
           <div style="display:flex;align-items:center;gap:12px;margin-bottom:10px">
+            <span style="background:#ffffff11;color:#8b8070;border-radius:4px;padding:3px 10px;font-size:11px">Auction 43</span>
             <span style="background:#ffffff11;color:#8b8070;border-radius:4px;padding:3px 10px;font-size:11px">94 words</span>
             <span style="background:#3b82f622;color:#3b82f6;border:1px solid #3b82f655;border-radius:4px;padding:2px 8px;font-size:11px;margin-right:4px">Cites Seller</span><span style="background:#ef444422;color:#ef4444;border:1px solid #ef444455;border-radius:4px;padding:2px 8px;font-size:11px;margin-right:4px">References Failures</span><span style="background:#f59e0b22;color:#f59e0b;border:1px solid #f59e0b55;border-radius:4px;padding:2px 8px;font-size:11px;margin-right:4px">Mentions Prices</span><span style="background:#8b5cf622;color:#8b5cf6;border:1px solid #8b5cf655;border-radius:4px;padding:2px 8px;font-size:11px;margin-right:4px">Quantitative</span>
           </div>
@@ -274,6 +286,8 @@
         </div>
         <div style="background:#161200;border:1px solid #3d3000;border-left:3px solid #f59e0b;border-radius:8px;padding:20px;margin-bottom:18px">
           <div style="display:flex;align-items:center;gap:12px;margin-bottom:10px">
+            <span style="background:#ffffff11;color:#8b8070;border-radius:4px;padding:3px 10px;font-size:11px">Auction 47</span>
+
             <span style="background:#ffffff11;color:#8b8070;border-radius:4px;padding:3px 10px;font-size:11px">99 words</span>
             <span style="background:#3b82f622;color:#3b82f6;border:1px solid #3b82f655;border-radius:4px;padding:2px 8px;font-size:11px;margin-right:4px">Cites Seller</span><span style="background:#ef444422;color:#ef4444;border:1px solid #ef444455;border-radius:4px;padding:2px 8px;font-size:11px;margin-right:4px">References Failures</span><span style="background:#f59e0b22;color:#f59e0b;border:1px solid #f59e0b55;border-radius:4px;padding:2px 8px;font-size:11px;margin-right:4px">Mentions Prices</span><span style="background:#10b98122;color:#10b981;border:1px solid #10b98155;border-radius:4px;padding:2px 8px;font-size:11px;margin-right:4px">Historical Pattern</span>
           </div>
@@ -288,14 +302,9 @@
 
 
 <div class="narrative" style="border-left-color:#fb923c">
-  <strong>Why this environment works:</strong> Most RL environments train a single agent against a fixed world.
-  Auditron is different — it's a living three-way economy where every agent's behavior shapes the incentives of
-  the others. Dishonest suppliers adapt their bidding to avoid detection. The auditor learns to read behavioral
-  patterns across rounds, not just prices. The buyer calibrates how much to trust the auditor's flags. No agent
-  can optimize in isolation. That interdependence is exactly what makes emergent reasoning possible — and exactly
-  what makes this a compelling testbed for scalable oversight in multi-agent settings. The auditor's reasoning
-  arc you see above isn't the result of hand-crafting: it's what falls out naturally when the environment
-  creates the right pressure.
+  Standard RL setups have one agent optimizing against a static world. Here, three agent classes adapt simultaneously. Each one changes the problem the others face. A dishonest supplier that gets flagged too often adjusts its bids. An auditor that learns that pattern has to keep updating as the strategy shifts. The buyer's reliance on auditor flags adjusts based on track record.
+
+  The reasoning in the auditor quotes above wasn't prompted or scaffolded. The training signal just had to create enough pressure.
 </div>
 
 <div class="footer">
