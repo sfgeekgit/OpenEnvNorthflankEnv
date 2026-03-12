@@ -12,7 +12,7 @@ This project was built for the OpenEnv Hackathon SF (March 2026). **[View the in
 
 ---
 
-## 📊 [→ VIEW FULL TRAINING REPORT ←](https://sfgeekgit.github.io/OpenEnvNorthflankEnv/reports/)
+## 📊 [→ VIEW FULL TRAINING REPORT ←](https://sfgeekgit.github.io/PyTorchOpenEnv_Auditron_trainer/reports/)
 
 ---
 
@@ -72,7 +72,7 @@ Supplier personalities are reshuffled randomly every episode, so no agent can le
 
 ---
 
-## 📊 [→ VIEW FULL TRAINING REPORT ←](https://sfgeekgit.github.io/OpenEnvNorthflankEnv/reports/)
+## 📊 [→ VIEW FULL TRAINING REPORT ←](https://sfgeekgit.github.io/PyTorchOpenEnv_Auditron_trainer/reports/)
 
 ---
 
