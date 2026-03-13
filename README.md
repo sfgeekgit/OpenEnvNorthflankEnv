@@ -2,7 +2,11 @@
 
 ## Hackathon Submission: March 2026
 
-This project was built for the OpenEnv Hackathon SF (March 2026). **[View the interactive notebook on Google Colab](https://colab.research.google.com/drive/172BW3iSEKZN0T07OMqxSOFDk_ElwqOeu)**, which includes the full training pipeline and results visualization.
+
+## [→ VIEW FULL TRAINING REPORT ←](https://huggingface.co/spaces/shapiron/auditron-env)
+
+
+This project was built for the OpenEnv Hackathon SF (March 2026). The original notebook was turned off when the event ended. View an interactive notebook on **[Google Colab](https://colab.research.google.com/drive/172BW3iSEKZN0T07OMqxSOFDk_ElwqOeu)**, what you should really look at is the post run [report](https://huggingface.co/spaces/shapiron/auditron-env)
 
 ---
 
